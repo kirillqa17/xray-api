@@ -123,7 +123,6 @@ async fn cleanup_task(pool: web::Data<PgPool>) {
 
 async fn add(
     uuid: web::Path<String>,
-    days: web::Json<u32>,
 ) -> HttpResponse {
     let uuid = uuid.into_inner();
 
@@ -141,13 +140,13 @@ async fn add(
     HttpResponse::Ok().body(format!("Пользователь уже существует в конфиге"))
 }
 
-async fn add(
+async fn remove(
     uuid: web::Path<String>,
 ) -> HttpResponse {
     let uuid = uuid.into_inner();
 
     // Проверяем, существует ли пользователь в конфиге Xray
-    if let user_exists_in_config = check_user_in_xray_config(&uuid.to_string()){
+    if check_user_in_xray_config(&uuid.to_string()){
         if let Err(e) = remove_user_from_xray_config(&uuid.to_string()) {
             return HttpResponse::InternalServerError().body(format!("Xray конфиг ошибка: {}", e));
         }
@@ -181,12 +180,8 @@ async fn main() -> std::io::Result<()> {
     HttpServer::new(move || {
         App::new()
             .app_data(web::Data::new(pool.clone()))
-            .service(
-                web::resource("extend/{uuid}")
-                    .route(web::post().to(add)),
-                web::resource("remove/{uuid}")
-                    .route(web::post().to(remove)),
-            )
+            .service(web::resource("extend/{uuid}").route(web::post().to(add)))
+            .service(web::resource("remove/{uuid}").route(web::post().to(remove)))
     })
     .bind_openssl("0.0.0.0:443", builder)?
     .run()
