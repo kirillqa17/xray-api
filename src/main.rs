@@ -1,16 +1,11 @@
 use actix_web::{web, App, HttpResponse, HttpServer};
 use serde_json::json;
 use sqlx::postgres::PgPool;
-use uuid::Uuid;
-use chrono::Utc;
 use std::fs;
 use std::process::Command;
 use serde_json::Value;
 use std::time::Duration;
 use openssl::ssl::{SslAcceptor, SslFiletype, SslMethod};
-
-mod models;
-use models::{User, NewUser, AddReferralData};
 
 const XRAY_CONFIG_PATH: &str = "/usr/local/etc/xray/config.json";
 
@@ -126,9 +121,8 @@ async fn cleanup_task(pool: web::Data<PgPool>) {
 }
 
 
-async fn extend_subscription(
-    pool: web::Data<PgPool>,
-    uuid: web::Path<i64>,
+async fn add(
+    uuid: web::Path<String>,
     days: web::Json<u32>,
 ) -> HttpResponse {
     let uuid = uuid.into_inner();
@@ -141,8 +135,27 @@ async fn extend_subscription(
             return HttpResponse::InternalServerError().body(format!("Xray конфиг ошибка: {}", e));
         }
 
-        HttpResponse::Ok()
+        return HttpResponse::Ok().body(format!("Конфиг изменён"));
     }
+
+    HttpResponse::Ok().body(format!("Пользователь уже существует в конфиге"))
+}
+
+async fn add(
+    uuid: web::Path<String>,
+) -> HttpResponse {
+    let uuid = uuid.into_inner();
+
+    // Проверяем, существует ли пользователь в конфиге Xray
+    if let user_exists_in_config = check_user_in_xray_config(&uuid.to_string()){
+        if let Err(e) = remove_user_from_xray_config(&uuid.to_string()) {
+            return HttpResponse::InternalServerError().body(format!("Xray конфиг ошибка: {}", e));
+        }
+
+        return HttpResponse::Ok().body(format!("Конфиг изменён"));
+    }
+
+    HttpResponse::Ok().body(format!("Пользователя не существует в конфиге"))
 }
 
 
@@ -169,8 +182,10 @@ async fn main() -> std::io::Result<()> {
         App::new()
             .app_data(web::Data::new(pool.clone()))
             .service(
-                web::resource("extend/{telegram_id}")
-                    .route(web::patch().to(extend_subscription)),
+                web::resource("extend/{uuid}")
+                    .route(web::post().to(add)),
+                web::resource("remove/{uuid}")
+                    .route(web::post().to(remove)),
             )
     })
     .bind_openssl("0.0.0.0:443", builder)?
