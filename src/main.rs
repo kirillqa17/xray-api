@@ -180,7 +180,7 @@ async fn main() -> std::io::Result<()> {
     HttpServer::new(move || {
         App::new()
             .app_data(web::Data::new(pool.clone()))
-            .service(web::resource("extend/{uuid}").route(web::post().to(add)))
+            .service(web::resource("add/{uuid}").route(web::post().to(add)))
             .service(web::resource("remove/{uuid}").route(web::post().to(remove)))
     })
     .bind_openssl("0.0.0.0:443", builder)?
