@@ -9,16 +9,24 @@ use openssl::ssl::{SslAcceptor, SslFiletype, SslMethod};
 
 const XRAY_CONFIG_PATH: &str = "/usr/local/etc/xray/config.json";
 
-fn update_xray_config(uuid: &str) -> Result<(), String> {
+fn update_xray_config(uuid: &str, conn_limit: i32) -> Result<(), String> {
     let config_data = fs::read_to_string(XRAY_CONFIG_PATH)
         .map_err(|e| format!("Ошибка чтения конфигурации: {}", e))?;
+    
     let mut config: Value = serde_json::from_str(&config_data)
         .map_err(|e| format!("Ошибка парсинга JSON: {}", e))?;
+
     if let Some(inbounds) = config["inbounds"].as_array_mut() {
         for inbound in inbounds {
             if inbound["tag"] == "vless-inbound" {
                 if let Some(clients) = inbound["settings"]["clients"].as_array_mut() {
-                    clients.push(json!({ "id": uuid }));
+                    let new_client = json!({
+                        "id": uuid,
+                        "flow": "xtls-rprx-vision",
+                        "connLimit": conn_limit
+                    });
+                    
+                    clients.push(new_client);
                 }
             }
         }
@@ -31,7 +39,7 @@ fn update_xray_config(uuid: &str) -> Result<(), String> {
         .arg("restart")
         .arg("xray")
         .output()
-        .map_err(|e| format!("Ошибка при отправке SIGHUP: {}", e))?;
+        .map_err(|e| format!("Ошибка при перезапуске Xray: {}", e))?;
 
     Ok(())
 }
@@ -60,7 +68,7 @@ fn remove_user_from_xray_config(uuid: &str) -> Result<(), String> {
         .arg("restart")
         .arg("xray")
         .output()
-        .map_err(|e| format!("Ошибка при отправке SIGHUP: {}", e))?;
+        .map_err(|e| format!("Ошибка при перезапуске Xray: {}", e))?;
 
     Ok(())
 }
@@ -68,29 +76,25 @@ fn remove_user_from_xray_config(uuid: &str) -> Result<(), String> {
 fn check_user_in_xray_config(uuid: &str) -> bool {
     let config_data = match fs::read_to_string(XRAY_CONFIG_PATH) {
         Ok(data) => data,
-        Err(_) => return false,  // Если не удалось прочитать конфиг, считаем, что пользователя нет
+        Err(_) => return false,
     };
 
     let config: Value = match serde_json::from_str(&config_data) {
         Ok(config) => config,
-        Err(_) => return false,  // Если не удалось распарсить JSON, считаем, что пользователя нет
+        Err(_) => return false,
     };
 
     if let Some(inbounds) = config["inbounds"].as_array() {
         for inbound in inbounds {
             if inbound["tag"] == "vless-inbound" {
                 if let Some(clients) = inbound["settings"]["clients"].as_array() {
-                    for client in clients {
-                        if client["id"] == uuid {
-                            return true;  // Пользователь найден в конфиге
-                        }
-                    }
+                    return clients.iter().any(|client| client["id"] == uuid);
                 }
             }
         }
     }
 
-    false  // Если пользователь не найден
+    false
 }
 
 async fn cleanup_task(pool: web::Data<PgPool>) {
@@ -120,24 +124,26 @@ async fn cleanup_task(pool: web::Data<PgPool>) {
     }
 }
 
-
 async fn add(
-    uuid: web::Path<String>,
+    path: web::Path<String>,
+    data: web::Json<i32>,
 ) -> HttpResponse {
-    let uuid = uuid.into_inner();
+    let uuid = path.into_inner();
+    let conn_limit = data.into_inner();
 
-    // Проверяем, существует ли пользователь в конфиге Xray
-    let user_exists_in_config = check_user_in_xray_config(&uuid.to_string());
-
-    if !user_exists_in_config {
-        if let Err(e) = update_xray_config(&uuid.to_string()) {
-            return HttpResponse::InternalServerError().body(format!("Xray конфиг ошибка: {}", e));
-        }
-
-        return HttpResponse::Ok().body(format!("Конфиг изменён"));
+    if check_user_in_xray_config(&uuid) {
+        return HttpResponse::Conflict().body("Пользователь уже существует в конфиге");
     }
 
-    HttpResponse::Ok().body(format!("Пользователь уже существует в конфиге"))
+    match update_xray_config(&uuid, conn_limit) {
+        Ok(_) => HttpResponse::Ok().json(json!({
+            "status": "success",
+            "message": "Пользователь добавлен",
+            "uuid": uuid,
+            "conn_limit": conn_limit
+        })),
+        Err(e) => HttpResponse::InternalServerError().body(format!("Ошибка: {}", e)),
+    }
 }
 
 async fn remove(
@@ -145,18 +151,19 @@ async fn remove(
 ) -> HttpResponse {
     let uuid = uuid.into_inner();
 
-    // Проверяем, существует ли пользователь в конфиге Xray
-    if check_user_in_xray_config(&uuid.to_string()){
-        if let Err(e) = remove_user_from_xray_config(&uuid.to_string()) {
-            return HttpResponse::InternalServerError().body(format!("Xray конфиг ошибка: {}", e));
-        }
-
-        return HttpResponse::Ok().body(format!("Конфиг изменён"));
+    if !check_user_in_xray_config(&uuid) {
+        return HttpResponse::NotFound().body("Пользователь не найден в конфиге");
     }
 
-    HttpResponse::Ok().body(format!("Пользователя не существует в конфиге"))
+    match remove_user_from_xray_config(&uuid) {
+        Ok(_) => HttpResponse::Ok().json(json!({
+            "status": "success",
+            "message": "Пользователь удален",
+            "uuid": uuid
+        })),
+        Err(e) => HttpResponse::InternalServerError().body(format!("Ошибка: {}", e)),
+    }
 }
-
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
@@ -166,11 +173,9 @@ async fn main() -> std::io::Result<()> {
         .await
         .unwrap();
 
-    // Настройка SSL
     let mut builder = SslAcceptor::mozilla_intermediate(SslMethod::tls())?;
     builder.set_private_key_file("certs/privkey.pem", SslFiletype::PEM)?;
     builder.set_certificate_chain_file("certs/fullchain.pem")?;
-
 
     let pool_clone = pool.clone();
     tokio::spawn(async move {
@@ -180,8 +185,8 @@ async fn main() -> std::io::Result<()> {
     HttpServer::new(move || {
         App::new()
             .app_data(web::Data::new(pool.clone()))
-            .service(web::resource("add/{uuid}").route(web::post().to(add)))
-            .service(web::resource("remove/{uuid}").route(web::post().to(remove)))
+            .service(web::resource("/add/{uuid}").route(web::post().to(add)))
+            .service(web::resource("/remove/{uuid}").route(web::post().to(remove)))
     })
     .bind_openssl("0.0.0.0:443", builder)?
     .run()
